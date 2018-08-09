@@ -7,21 +7,16 @@
 #include "gatt_def.h"
 #include "gattchar_def.h"
 
-#include <collection.h>
 #include <cstring>
 #include <functional>
-#include <pplawait.h>
-#include <ppltasks.h>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
-#include <wrl/wrappers/corewrappers.h>
 #include <Windows.Devices.Bluetooth.h>
 
-using namespace concurrency;
 using namespace std;
 using namespace Windows::Devices::Bluetooth;
 using namespace Windows::Devices::Bluetooth::Advertisement;
@@ -71,10 +66,50 @@ private:
         }
 
         auto partial = bind(handler, context, this, placeholders::_1);
-        create_task(characteristic->WriteValueAsync(CryptographicBuffer::CreateFromByteArray(wrapper), option))
-            .then([partial](GattCommunicationStatus status) {
-                partial(status == GattCommunicationStatus::Success ? nullptr : WARBLE_GATT_WRITE_ERROR);
-            }).CHECK_TASK_ERROR(partial);
+        auto task = characteristic->WriteValueAsync(CryptographicBuffer::CreateFromByteArray(wrapper), option);
+
+        task->Completed = ref new AsyncOperationCompletedHandler<GattCommunicationStatus>([partial](IAsyncOperation<GattCommunicationStatus>^ result, Windows::Foundation::AsyncStatus status) {
+            switch (status) {
+            case Windows::Foundation::AsyncStatus::Completed:
+                partial(nullptr);
+                break;
+            case Windows::Foundation::AsyncStatus::Canceled:
+                partial("Gatt characteristic write cancelled");
+                break;
+            case Windows::Foundation::AsyncStatus::Error:
+                stringstream buffer;
+                buffer << "Failed to write gatt characteristic value (HRESULT = " << result->ErrorCode.Value << ")";
+
+                partial(buffer.str().c_str());
+                break;
+            }
+        });
+    }
+
+    inline void edit_notifiation_status_async(GattClientCharacteristicConfigurationDescriptorValue descriptorValue, void* context, FnVoid_VoidP_WarbleGattCharP_CharP handler) {
+        auto partial = bind(handler, context, this, placeholders::_1);
+
+        auto task = characteristic->WriteClientCharacteristicConfigurationDescriptorAsync(descriptorValue);
+        task->Completed = ref new AsyncOperationCompletedHandler<GattCommunicationStatus>([partial, descriptorValue](IAsyncOperation<GattCommunicationStatus>^ result, Windows::Foundation::AsyncStatus status) {
+            switch (status) {
+            case Windows::Foundation::AsyncStatus::Completed:
+                partial(nullptr);
+                break;
+            case Windows::Foundation::AsyncStatus::Canceled: {
+                stringstream buffer;
+                buffer << "Edit characteristic configuration (" << static_cast<int>(descriptorValue) << ") cancelled";
+
+                partial(buffer.str().c_str());
+                break;
+            }
+            case Windows::Foundation::AsyncStatus::Error:
+                stringstream buffer;
+                buffer << "Failed to edit characteristic configuration (" << static_cast<int>(descriptorValue) << ") failed (HRESULT = " << result->ErrorCode.Value << ")";
+
+                partial(buffer.str().c_str());
+                break;
+            }
+        });
     }
 
     WarbleGatt* owner;
@@ -104,10 +139,18 @@ struct WarbleGatt_Win10 : public WarbleGatt {
     virtual bool is_connected() const;
 
     virtual WarbleGattChar* find_characteristic(const string& uuid) const;
+    virtual void find_characteristic_async(const char* service, const char* uuid, void* context, void(*handler)(void*, WarbleGatt*, WarbleGattChar*));
     virtual bool service_exists(const string& uuid) const;
 
 private:
     void cleanup(bool dispose = true);
+
+    void device_discover_completed(void* context, FnVoid_VoidP_WarbleGattP_CharP handler);
+    void discover_characteristics(GattDeviceServicesResult^ result, unsigned int i, void* context, FnVoid_VoidP_WarbleGattP_CharP handler);
+    inline void connect_error(void* context, FnVoid_VoidP_WarbleGattP_CharP handler, const char* msg) {
+        cleanup();
+        handler(context, this, msg);
+    }
 
     string mac;
 
@@ -158,12 +201,64 @@ WarbleGatt_Win10::~WarbleGatt_Win10() {
     cleanup();
 }
 
-void WarbleGatt_Win10::connect_async(void* context, FnVoid_VoidP_WarbleGattP_CharP handler) {
-    task_completion_event<void> discover_device_event;
-    task<void> event_set(discover_device_event);
+void WarbleGatt_Win10::device_discover_completed(void* context, FnVoid_VoidP_WarbleGattP_CharP handler) {
+    auto task = device->GetGattServicesAsync(BluetoothCacheMode::Uncached);
+    task->Completed = ref new AsyncOperationCompletedHandler<GattDeviceServicesResult^>([this, context, handler](IAsyncOperation<GattDeviceServicesResult^>^ info, Windows::Foundation::AsyncStatus status) {
+        switch (status) {
+        case Windows::Foundation::AsyncStatus::Completed:
+            discover_characteristics(info->GetResults(), 0, context, handler);
+            break;
+        case Windows::Foundation::AsyncStatus::Canceled:
+            connect_error(context, handler, "Gatt service discovery cancelled");
+            break;
+        case Windows::Foundation::AsyncStatus::Error:
+            stringstream buffer;
+            buffer << "Failed to discover gatt services (status = " << info->ErrorCode.Value << ")";
 
+            connect_error(context, handler, buffer.str().c_str());
+            break;
+        }
+    });
+}
+
+void WarbleGatt_Win10::discover_characteristics(GattDeviceServicesResult^ result, unsigned int i, void* context, FnVoid_VoidP_WarbleGattP_CharP handler) {
+    if (result->Services->Size <= i) {
+        handler(context, this, nullptr);
+        return;
+    }
+
+    auto service = result->Services->GetAt(i);
+    services.emplace(service->Uuid, service);
+
+    auto task = service->GetCharacteristicsAsync();
+    task->Completed = ref new AsyncOperationCompletedHandler<GattCharacteristicsResult^>([this, i, result, context, handler](IAsyncOperation<GattCharacteristicsResult^>^ info, Windows::Foundation::AsyncStatus status) {
+        switch (status) {
+        case Windows::Foundation::AsyncStatus::Completed: {
+            auto characteristics = info->GetResults()->Characteristics;
+
+            for (unsigned int j = 0; j < characteristics->Size; j++) {
+                this->characteristics.emplace(characteristics->GetAt(j)->Uuid, new WarbleGattChar_Win10(this, characteristics->GetAt(j)));
+            }
+
+            discover_characteristics(result, i + 1, context, handler);
+            break;
+        }
+        case Windows::Foundation::AsyncStatus::Canceled:
+            connect_error(context, handler, "Gatt characteristic discovery cancelled");
+            break;
+        case Windows::Foundation::AsyncStatus::Error:
+            stringstream buffer;
+            buffer << "Failed to discover gatt characteristics (status = " << info->ErrorCode.Value << ")";
+
+            connect_error(context, handler, buffer.str().c_str());
+            break;
+        }
+    });
+}
+
+void WarbleGatt_Win10::connect_async(void* context, FnVoid_VoidP_WarbleGattP_CharP handler) {
     if (device != nullptr) {
-        discover_device_event.set();
+        device_discover_completed(context, handler);
     } else {
         string mac_copy(mac);
         mac_copy.erase(2, 1);
@@ -174,66 +269,42 @@ void WarbleGatt_Win10::connect_async(void* context, FnVoid_VoidP_WarbleGattP_Cha
 
         size_t temp;
         uint64_t mac_ulong = stoull(mac_copy.c_str(), &temp, 16);
-        create_task(BluetoothLEDevice::FromBluetoothAddressAsync(mac_ulong, addr_type)).then([discover_device_event, this](BluetoothLEDevice^ device) {
-            if (device == nullptr) {
-                discover_device_event.set_exception(runtime_error("Failed to discover device (FromBluetoothAddressAsync returned nullptr)"));
-            } else {
-                cookie = device->ConnectionStatusChanged += ref new TypedEventHandler<BluetoothLEDevice^, Object^>([this](BluetoothLEDevice^ sender, Object^ args) {
-                    switch (sender->ConnectionStatus) {
-                    case BluetoothConnectionStatus::Disconnected:
-                        cleanup(false);
 
-                        if (on_disconnect_handler != nullptr) {
-                            on_disconnect_handler(on_disconnect_context, this, 0);
+        auto task = BluetoothLEDevice::FromBluetoothAddressAsync(mac_ulong, addr_type);
+        task->Completed = ref new AsyncOperationCompletedHandler<BluetoothLEDevice^>([this, context, handler](IAsyncOperation<BluetoothLEDevice^>^ info, Windows::Foundation::AsyncStatus status) {
+            switch (status) {
+            case Windows::Foundation::AsyncStatus::Completed:
+                if (info->GetResults() == nullptr) {
+                    connect_error(context, handler, "Failed to discover device (FromBluetoothAddressAsync returned nullptr)");
+                } else {
+                    cookie = info->GetResults()->ConnectionStatusChanged += ref new TypedEventHandler<BluetoothLEDevice^, Object^>([this](BluetoothLEDevice^ sender, Object^ args) {
+                        switch (sender->ConnectionStatus) {
+                        case BluetoothConnectionStatus::Disconnected:
+                            cleanup(false);
+
+                            if (on_disconnect_handler != nullptr) {
+                                on_disconnect_handler(on_disconnect_context, this, 0);
+                            }
+                            break;
                         }
-                        break;
-                    }
-                });
+                    });
 
-                this->device = device;
-                discover_device_event.set();
+                    this->device = info->GetResults();
+                    device_discover_completed(context, handler);
+                }
+                break;
+            case Windows::Foundation::AsyncStatus::Canceled:
+                connect_error(context, handler, "Gatt connect cancelled");
+                break;
+            case Windows::Foundation::AsyncStatus::Error:
+                stringstream buffer;
+                buffer << "Failed to connect to remote device (HRESULT = " << info->ErrorCode.Value << ")";
+
+                connect_error(context, handler, buffer.str().c_str());
+                break;
             }
         });
     }
-
-    auto partial = bind(handler, context, this, placeholders::_1); 
-    auto error_handler = [this, partial](const char* msg) {
-        cleanup();
-        partial(msg);
-    };
-
-    event_set.then([this]() {
-        return create_task(device->GetGattServicesAsync(BluetoothCacheMode::Uncached));
-    }).then([this](GattDeviceServicesResult^ result) {
-        vector<task<GattCharacteristicsResult^>> find_gattchar_tasks;
-        if (result->Status == GattCommunicationStatus::Success) {
-            for (auto it : result->Services) {
-                services.emplace(it->Uuid, it);
-                find_gattchar_tasks.push_back(create_task(it->GetCharacteristicsAsync(BluetoothCacheMode::Uncached)));
-            }
-
-            return when_all(begin(find_gattchar_tasks), end(find_gattchar_tasks));
-        }
-
-        stringstream buffer;
-        buffer << "Failed to discover gatt services (status = " << static_cast<int>(result->Status) << ")";
-
-        throw runtime_error(buffer.str());
-    }).then([this, partial](vector<GattCharacteristicsResult^> results) {
-        for (auto it : results) {
-            if (it->Status == GattCommunicationStatus::Success) {
-                for (auto it2 : it->Characteristics) {
-                    characteristics.emplace(it2->Uuid, new WarbleGattChar_Win10(this, it2));
-                }
-            } else {
-                stringstream buffer;
-                buffer << "Failed to discover gatt characteristics (status = " << static_cast<int>(it->Status) << ")";
-
-                throw runtime_error(buffer.str());
-            }
-        }
-        partial(nullptr);
-    }).CHECK_TASK_ERROR(error_handler);
 }
 
 void WarbleGatt_Win10::disconnect() {
@@ -289,6 +360,42 @@ WarbleGattChar* WarbleGatt_Win10::find_characteristic(const string& uuid) const 
     return nullptr;
 }
 
+void WarbleGatt_Win10::find_characteristic_async(const char* service, const char* uuid, void* context, void(*handler)(void*, WarbleGatt*, WarbleGattChar*)) {
+    GUID raw;
+    if (SUCCEEDED(string_to_guid(service, raw))) {
+        auto it = services.find(raw);
+        if (it != services.end()) {
+            auto task = it->second->GetCharacteristicsAsync();
+            task->Completed = ref new AsyncOperationCompletedHandler<GattCharacteristicsResult^>([this, uuid, context, handler](IAsyncOperation<GattCharacteristicsResult^>^ info, Windows::Foundation::AsyncStatus status) {
+                switch (status) {
+                case Windows::Foundation::AsyncStatus::Completed: {
+                    auto characteristics = info->GetResults()->Characteristics;
+
+                    for (unsigned int j = 0; j < characteristics->Size; j++) {
+                        this->characteristics.emplace(characteristics->GetAt(j)->Uuid, new WarbleGattChar_Win10(this, characteristics->GetAt(j)));
+                    }
+
+                    GUID raw;
+                    if (SUCCEEDED(string_to_guid(uuid, raw))) {
+                        auto it = this->characteristics.find(raw);
+                        handler(context, this, it == this->characteristics.end() ? nullptr : it->second);
+                    } else {
+                        handler(context, this, nullptr);
+                    }
+                    break;
+                }
+                case Windows::Foundation::AsyncStatus::Canceled:
+                    handler(context, this, nullptr);
+                    break;
+                case Windows::Foundation::AsyncStatus::Error:
+                    handler(context, this, nullptr);
+                    break;
+                }
+            });
+        }
+    }
+}
+
 bool WarbleGatt_Win10::service_exists(const string& uuid) const {
     GUID raw;
     return SUCCEEDED(string_to_guid(uuid, raw)) ? services.count(raw) : 0;
@@ -316,33 +423,34 @@ void WarbleGattChar_Win10::read_async(void* context, FnVoid_VoidP_WarbleGattChar
     auto partial = bind(handler, context, this, placeholders::_1, placeholders::_2, placeholders::_3);
     auto partial_error = bind(partial, nullptr, 0, placeholders::_1);
 
-    create_task(characteristic->ReadValueAsync()).then([partial, partial_error](GattReadResult^ result) {
-        if (result->Status == GattCommunicationStatus::Success) {
-            Array<byte>^ wrapper = ref new Array<byte>(result->Value->Length);
-            CryptographicBuffer::CopyToByteArray(result->Value, &wrapper);
+    auto task = characteristic->ReadValueAsync();
+    task->Completed = ref new AsyncOperationCompletedHandler<GattReadResult^>([partial, partial_error](IAsyncOperation<GattReadResult^>^ result, Windows::Foundation::AsyncStatus status) {
+        switch (status) {
+        case Windows::Foundation::AsyncStatus::Completed: {
+            Array<byte>^ wrapper = ref new Array<byte>(result->GetResults()->Value->Length);
+            CryptographicBuffer::CopyToByteArray(result->GetResults()->Value, &wrapper);
             partial((uint8_t*)wrapper->Data, wrapper->Length, nullptr);
-        } else {
-            partial_error(WARBLE_GATT_READ_ERROR);
+            break;
         }
-    }).CHECK_TASK_ERROR(partial_error);
+        case Windows::Foundation::AsyncStatus::Canceled:
+            partial_error("Gatt characteristic read cancelled");
+            break;
+        case Windows::Foundation::AsyncStatus::Error:
+            stringstream buffer;
+            buffer << "Failed to read gatt characteristic value (HRESULT = " << result->ErrorCode.Value << ")";
+
+            partial_error(buffer.str().c_str());
+            break;
+        }
+    });
 }
 
 void WarbleGattChar_Win10::enable_notifications_async(void* context, FnVoid_VoidP_WarbleGattCharP_CharP handler) {
-    auto partial = bind(handler, context, this, placeholders::_1);
-    
-    create_task(characteristic->WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify))
-        .then([partial](GattCommunicationStatus status) {
-            partial(status == GattCommunicationStatus::Success ? nullptr : WARBLE_GATT_ENABLE_NOTIFY_ERROR);
-        }).CHECK_TASK_ERROR(partial);
+    edit_notifiation_status_async(GattClientCharacteristicConfigurationDescriptorValue::Notify, context, handler);
 }
 
 void WarbleGattChar_Win10::disable_notifications_async(void* context, FnVoid_VoidP_WarbleGattCharP_CharP handler) {
-    auto partial = bind(handler, context, this, placeholders::_1);
-
-    create_task(characteristic->WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::None))
-        .then([partial](GattCommunicationStatus status) {
-            partial(status == GattCommunicationStatus::Success ? nullptr : WARBLE_GATT_DISABLE_NOTIFY_ERROR);
-        }).CHECK_TASK_ERROR(partial);
+    edit_notifiation_status_async(GattClientCharacteristicConfigurationDescriptorValue::None, context, handler);
 }
 
 void WarbleGattChar_Win10::on_notification_received(void* context, FnVoid_VoidP_WarbleGattCharP_UbyteP_Ubyte handler) {
