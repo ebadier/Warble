@@ -58,6 +58,8 @@ WARBLE_API void warble_gatt_on_disconnect(WarbleGatt* obj, void* context, FnVoid
  */
 WARBLE_API WARBLE_INT warble_gatt_is_connected(const WarbleGatt* obj);
 
+WARBLE_API void warble_gatt_find_characteristic_async(WarbleGatt* obj, const char* service, const char* uuid, void* context, FnVoid_VoidP_WarbleGattCharP_CharP handler);
+
 /**
  * Checks if a GATT characteristic exists with the uuid
  * @param obj           Calling object

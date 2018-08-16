@@ -138,15 +138,14 @@ struct WarbleGatt_Win10 : public WarbleGatt {
     virtual void on_disconnect(void* context, FnVoid_VoidP_WarbleGattP_Int handler);
     virtual bool is_connected() const;
 
+    virtual void find_characteristic_async(const char* service, const char* uuid, void* context, FnVoid_VoidP_WarbleGattCharP_CharP handler);
     virtual WarbleGattChar* find_characteristic(const string& uuid) const;
-    virtual void find_characteristic_async(const char* service, const char* uuid, void* context, void(*handler)(void*, WarbleGatt*, WarbleGattChar*));
     virtual bool service_exists(const string& uuid) const;
 
 private:
     void cleanup(bool dispose = true);
 
     void device_discover_completed(void* context, FnVoid_VoidP_WarbleGattP_CharP handler);
-    void discover_characteristics(GattDeviceServicesResult^ result, unsigned int i, void* context, FnVoid_VoidP_WarbleGattP_CharP handler);
     inline void connect_error(void* context, FnVoid_VoidP_WarbleGattP_CharP handler, const char* msg) {
         cleanup();
         handler(context, this, msg);
@@ -206,7 +205,11 @@ void WarbleGatt_Win10::device_discover_completed(void* context, FnVoid_VoidP_War
     task->Completed = ref new AsyncOperationCompletedHandler<GattDeviceServicesResult^>([this, context, handler](IAsyncOperation<GattDeviceServicesResult^>^ info, Windows::Foundation::AsyncStatus status) {
         switch (status) {
         case Windows::Foundation::AsyncStatus::Completed:
-            discover_characteristics(info->GetResults(), 0, context, handler);
+            for (unsigned int i = 0; i < info->GetResults()->Services->Size; i++) {
+                auto service = info->GetResults()->Services->GetAt(i);
+                services.emplace(service->Uuid, service);
+            }
+            handler(context, this, nullptr);
             break;
         case Windows::Foundation::AsyncStatus::Canceled:
             connect_error(context, handler, "Gatt service discovery cancelled");
@@ -214,41 +217,6 @@ void WarbleGatt_Win10::device_discover_completed(void* context, FnVoid_VoidP_War
         case Windows::Foundation::AsyncStatus::Error:
             stringstream buffer;
             buffer << "Failed to discover gatt services (status = " << info->ErrorCode.Value << ")";
-
-            connect_error(context, handler, buffer.str().c_str());
-            break;
-        }
-    });
-}
-
-void WarbleGatt_Win10::discover_characteristics(GattDeviceServicesResult^ result, unsigned int i, void* context, FnVoid_VoidP_WarbleGattP_CharP handler) {
-    if (result->Services->Size <= i) {
-        handler(context, this, nullptr);
-        return;
-    }
-
-    auto service = result->Services->GetAt(i);
-    services.emplace(service->Uuid, service);
-
-    auto task = service->GetCharacteristicsAsync();
-    task->Completed = ref new AsyncOperationCompletedHandler<GattCharacteristicsResult^>([this, i, result, context, handler](IAsyncOperation<GattCharacteristicsResult^>^ info, Windows::Foundation::AsyncStatus status) {
-        switch (status) {
-        case Windows::Foundation::AsyncStatus::Completed: {
-            auto characteristics = info->GetResults()->Characteristics;
-
-            for (unsigned int j = 0; j < characteristics->Size; j++) {
-                this->characteristics.emplace(characteristics->GetAt(j)->Uuid, new WarbleGattChar_Win10(this, characteristics->GetAt(j)));
-            }
-
-            discover_characteristics(result, i + 1, context, handler);
-            break;
-        }
-        case Windows::Foundation::AsyncStatus::Canceled:
-            connect_error(context, handler, "Gatt characteristic discovery cancelled");
-            break;
-        case Windows::Foundation::AsyncStatus::Error:
-            stringstream buffer;
-            buffer << "Failed to discover gatt characteristics (status = " << info->ErrorCode.Value << ")";
 
             connect_error(context, handler, buffer.str().c_str());
             break;
@@ -360,13 +328,38 @@ WarbleGattChar* WarbleGatt_Win10::find_characteristic(const string& uuid) const 
     return nullptr;
 }
 
-void WarbleGatt_Win10::find_characteristic_async(const char* service, const char* uuid, void* context, void(*handler)(void*, WarbleGatt*, WarbleGattChar*)) {
+void WarbleGatt_Win10::find_characteristic_async(const char* service, const char* uuid, void* context, FnVoid_VoidP_WarbleGattCharP_CharP handler) {
     GUID raw;
-    if (SUCCEEDED(string_to_guid(service, raw))) {
+    auto result = string_to_guid(service, raw);
+    if (SUCCEEDED(result)) {
         auto it = services.find(raw);
         if (it != services.end()) {
-            auto task = it->second->GetCharacteristicsAsync();
-            task->Completed = ref new AsyncOperationCompletedHandler<GattCharacteristicsResult^>([this, uuid, context, handler](IAsyncOperation<GattCharacteristicsResult^>^ info, Windows::Foundation::AsyncStatus status) {
+            result = string_to_guid(uuid, raw);
+            {
+                if (SUCCEEDED(result)) {
+                    auto it = this->characteristics.find(raw);
+
+                    if (it != this->characteristics.end()) {
+                        if (it->second == nullptr) {
+                            stringstream buffer;
+                            buffer << "Gatt characteristic '" << uuid << "' does not exist";
+
+                            handler(context, nullptr, buffer.str().c_str());
+                        } else {
+                            handler(context, it->second, nullptr);
+                        }
+                        return;
+                    }
+                } else {
+                    stringstream buffer;
+                    buffer << "Failed to convert characteristic uuid string to GUID struct (HRESULT = " << result << ")";
+                    handler(context, nullptr, buffer.str().c_str());
+                    return;
+                }
+            }
+
+            auto task = it->second->GetCharacteristicsAsync(BluetoothCacheMode::Uncached);
+            task->Completed = ref new AsyncOperationCompletedHandler<GattCharacteristicsResult^>([this, raw, uuid, context, handler](IAsyncOperation<GattCharacteristicsResult^>^ info, Windows::Foundation::AsyncStatus status) {
                 switch (status) {
                 case Windows::Foundation::AsyncStatus::Completed: {
                     auto characteristics = info->GetResults()->Characteristics;
@@ -375,24 +368,40 @@ void WarbleGatt_Win10::find_characteristic_async(const char* service, const char
                         this->characteristics.emplace(characteristics->GetAt(j)->Uuid, new WarbleGattChar_Win10(this, characteristics->GetAt(j)));
                     }
 
-                    GUID raw;
-                    if (SUCCEEDED(string_to_guid(uuid, raw))) {
-                        auto it = this->characteristics.find(raw);
-                        handler(context, this, it == this->characteristics.end() ? nullptr : it->second);
+                    auto it = this->characteristics.find(raw);
+                    if (it != this->characteristics.end()) {
+                        handler(context, it->second, nullptr);
                     } else {
-                        handler(context, this, nullptr);
+                        this->characteristics.emplace(raw, nullptr);
+
+                        stringstream buffer;
+                        buffer << "Gatt characteristic '" << uuid << "' does not exist";
+
+                        handler(context, nullptr, buffer.str().c_str());
                     }
+
                     break;
                 }
                 case Windows::Foundation::AsyncStatus::Canceled:
-                    handler(context, this, nullptr);
+                    handler(context, nullptr, "Gatt characteristic lookup task cancelled");
                     break;
                 case Windows::Foundation::AsyncStatus::Error:
-                    handler(context, this, nullptr);
+                    stringstream buffer;
+                    buffer << "Failed to retrieve gatt characteristic '" << uuid << "' (HRESULT = " << info->ErrorCode.Value << ")";
+
+                    handler(context, nullptr, buffer.str().c_str());
                     break;
                 }
             });
+        } else {
+            stringstream buffer;
+            buffer << "Gatt service '" << service << "' does not exist";
+            handler(context, nullptr, buffer.str().c_str());
         }
+    } else {
+        stringstream buffer;
+        buffer << "Failed to convert service uuid string to GUID struct (HRESULT = " << result << ")";
+        handler(context, nullptr, buffer.str().c_str());
     }
 }
 
@@ -408,6 +417,7 @@ WarbleGattChar_Win10::WarbleGattChar_Win10(WarbleGatt* owner, GattCharacteristic
 
 WarbleGattChar_Win10::~WarbleGattChar_Win10() {
     characteristic->ValueChanged -= cookie;
+    delete characteristic;
     characteristic = nullptr;
 }
 
@@ -454,11 +464,15 @@ void WarbleGattChar_Win10::disable_notifications_async(void* context, FnVoid_Voi
 }
 
 void WarbleGattChar_Win10::on_notification_received(void* context, FnVoid_VoidP_WarbleGattCharP_UbyteP_Ubyte handler) {
-    cookie = characteristic->ValueChanged += ref new TypedEventHandler<GattCharacteristic^, GattValueChangedEventArgs^>([context, handler, this](GattCharacteristic^ sender, GattValueChangedEventArgs^ obj) {
-        Array<byte>^ wrapper = ref new Array<byte>(obj->CharacteristicValue->Length);
-        CryptographicBuffer::CopyToByteArray(obj->CharacteristicValue, &wrapper);
-        handler(context, this, (uint8_t*)wrapper->Data, wrapper->Length);
-    });
+    characteristic->ValueChanged -= cookie;
+
+    if (handler != nullptr) {
+        cookie = characteristic->ValueChanged += ref new TypedEventHandler<GattCharacteristic^, GattValueChangedEventArgs^>([context, handler, this](GattCharacteristic^ sender, GattValueChangedEventArgs^ obj) {
+            Array<byte>^ wrapper = ref new Array<byte>(obj->CharacteristicValue->Length);
+            CryptographicBuffer::CopyToByteArray(obj->CharacteristicValue, &wrapper);
+            handler(context, this, (uint8_t*)wrapper->Data, wrapper->Length);
+        });
+    }
 }
 
 const char* WarbleGattChar_Win10::get_uuid() const {

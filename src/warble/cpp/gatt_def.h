@@ -16,6 +16,7 @@ struct WarbleGatt {
     virtual void on_disconnect(void* context, FnVoid_VoidP_WarbleGattP_Int handler) = 0;
     virtual bool is_connected() const = 0;
 
+    virtual void find_characteristic_async(const char* service, const char* uuid, void* context, FnVoid_VoidP_WarbleGattCharP_CharP handler) = 0;
     virtual WarbleGattChar* find_characteristic(const std::string& uuid) const = 0;
     virtual bool service_exists(const std::string& uuid) const = 0;
 };

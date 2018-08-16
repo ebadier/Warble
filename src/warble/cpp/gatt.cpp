@@ -42,6 +42,10 @@ int32_t warble_gatt_is_connected(const WarbleGatt* obj) {
     return obj->is_connected();
 }
 
+void warble_gatt_find_characteristic_async(WarbleGatt* obj, const char* service, const char* uuid, void* context, FnVoid_VoidP_WarbleGattCharP_CharP handler) {
+    obj->find_characteristic_async(service, uuid, context, handler);
+}
+
 WarbleGattChar* warble_gatt_find_characteristic(const WarbleGatt* obj, const char* uuid) {
     return obj->find_characteristic(uuid);
 }
